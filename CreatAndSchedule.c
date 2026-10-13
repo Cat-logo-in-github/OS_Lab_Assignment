@@ -421,6 +421,57 @@ void simulate(Process processes[], int n, Algorithm algorithm)
     }
 }
 
+/* ---------- 16.4: Metrics and standardized output ---------- */
+
+int result_id_compare(const void *left, const void *right)
+{
+    return compare_id(left, right);
+}
+
+void print_results(Process processes[], int n)
+{
+    double total_waiting = 0;
+    double total_turnaround = 0;
+    double total_response = 0;
+    int64_t busy = 0;
+    int64_t first_arrival = INT64_MAX;
+    int64_t last_completion = 0;
+
+    /* Sorting only after execution keeps presentation independent of scheduling. */
+    qsort(processes, (size_t)n, sizeof(processes[0]), result_id_compare);
+
+    for (int i = 0; i < n; i++) {
+        const Process *p = &processes[i];
+        int64_t turnaround = p->completion - p->arrival;
+        int64_t waiting = turnaround - p->service;
+        int64_t response = p->start - p->arrival;
+
+        printf("%s,%d,%d,%d,%" PRId64 ",%" PRId64 ",%" PRId64
+               ",%" PRId64 ",%" PRId64 "\n",
+               p->id, p->arrival, p->priority, p->service, p->start,
+               p->completion, waiting, turnaround, response);
+
+        total_waiting += waiting;
+        total_turnaround += turnaround;
+        total_response += response;
+        busy += p->service;
+        if (p->arrival < first_arrival)
+            first_arrival = p->arrival;
+        if (p->completion > last_completion)
+            last_completion = p->completion;
+    }
+
+    /* The observation interval starts at the first arrival, includes idle gaps,
+     * and ends when the final patient completes. Positive service makes it > 0. */
+    double elapsed = (double)(last_completion - first_arrival);
+    printf("SUMMARY\n");
+    printf("AVERAGE_WAITING,%.6f\n", total_waiting / n);
+    printf("AVERAGE_TURNAROUND,%.6f\n", total_turnaround / n);
+    printf("AVERAGE_RESPONSE,%.6f\n", total_response / n);
+    printf("THROUGHPUT,%.15f\n", n / elapsed);
+    printf("UTILIZATION,%.6f\n", 100.0 * busy / (DOCTORS * elapsed));
+}
+
 /* ---------- Command-line entry point ---------- */
 
 int main(int argc, char *argv[])
@@ -452,11 +503,7 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
 
     simulate(processes, n, algorithm);
-
-    for (int i = 0; i < n; i++) {
-        printf("Patient %s: Start %" PRId64 ", Completion %" PRId64 "\n",
-               processes[i].id, processes[i].start, processes[i].completion);
-    }
+    print_results(processes, n);
 
     return EXIT_SUCCESS;
 }
