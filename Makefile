@@ -32,3 +32,4 @@ compare: hospital
 
 clean:
 	$(RM) hospital hospital-ubsan hospital-sanitized
+	$(RM) -r hospital.dSYM hospital-ubsan.dSYM hospital-sanitized.dSYM

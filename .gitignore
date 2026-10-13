@@ -2,3 +2,4 @@
 /hospital-ubsan
 /hospital-sanitized
 __pycache__/
+*.dSYM/
