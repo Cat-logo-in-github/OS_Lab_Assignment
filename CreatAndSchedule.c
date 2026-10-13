@@ -1,4 +1,5 @@
-
+#include <inttypes.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,6 +31,9 @@ typedef struct {
 
     ProcessState state;
     int doctor;              /* -1 if not assigned */
+    int64_t remaining;
+    int64_t start;           /* First start; -1 until scheduled. */
+    int64_t completion;
 } Process;
 
 typedef struct {
@@ -118,6 +122,9 @@ int load_processes(const char *filename,
 
         p->state = NEW;
         p->doctor = -1;
+        p->remaining = p->service;
+        p->start = -1;
+        p->completion = -1;
     }
 
     fclose(fp);
@@ -128,7 +135,7 @@ int load_processes(const char *filename,
 /* Move patients into READY when their arrival time is reached. */
 void admit_arrivals(Process processes[],
                     int n,
-                    int time,
+                    int64_t time,
                     ReadySet *ready)
 {
     for (int i = 0; i < n; i++) {
@@ -211,6 +218,19 @@ int select_ready(const ReadySet *ready, Algorithm algorithm)
 
 /* ---------- 16.2: Scheduling ---------- */
 
+void start_process(Process *p,
+                   DoctorSlot doctors[DOCTORS],
+                   int doctor,
+                   int64_t time)
+{
+    if (p->start == -1)
+        p->start = time;
+
+    p->state = RUNNING;
+    p->doctor = doctor;
+    doctors[doctor].patient = p;
+}
+
 /*
  * Fill vacant doctor slots using FCFS or non-preemptive Priority.
  * The caller invokes this whenever arrivals or completions
@@ -218,7 +238,8 @@ int select_ready(const ReadySet *ready, Algorithm algorithm)
  */
 void schedule_non_preemptive(ReadySet *ready,
                              DoctorSlot doctors[DOCTORS],
-                             Algorithm algorithm)
+                             Algorithm algorithm,
+                             int64_t time)
 {
     while (ready->count > 0) {
         int free_doctor = -1;
@@ -236,9 +257,7 @@ void schedule_non_preemptive(ReadySet *ready,
         int index = select_ready(ready, algorithm);
         Process *p = ready_remove(ready, index);
 
-        p->state = RUNNING;
-        p->doctor = free_doctor;
-        doctors[free_doctor].patient = p;
+        start_process(p, doctors, free_doctor, time);
     }
 }
 
@@ -282,13 +301,13 @@ int select_preemption_victim(DoctorSlot doctors[DOCTORS])
  * Preempt only when the best waiting patient has strictly
  * higher priority than a running patient.
  *
- * Execution and remaining-service-time updates belong to
- * the execution module. This function only changes states
- * and assignments.
+ * The event loop accounts for elapsed service before scheduling,
+ * so returning a patient to READY preserves its remaining time.
  */
 void schedule_preemptive_priority(
     ReadySet *ready,
-    DoctorSlot doctors[DOCTORS])
+    DoctorSlot doctors[DOCTORS],
+    int64_t time)
 {
     while (ready->count > 0) {
         int best = select_ready(ready, PRIORITY);
@@ -306,9 +325,7 @@ void schedule_preemptive_priority(
         /* Always use a vacant doctor before preempting. */
         if (free_doctor != -1) {
             waiting = ready_remove(ready, best);
-            waiting->state = RUNNING;
-            waiting->doctor = free_doctor;
-            doctors[free_doctor].patient = waiting;
+            start_process(waiting, doctors, free_doctor, time);
             continue;
         }
 
@@ -330,9 +347,7 @@ void schedule_preemptive_priority(
 
         /* Assign the freed doctor to the higher-priority patient. */
         waiting = ready_remove(ready, best);
-        waiting->state = RUNNING;
-        waiting->doctor = victim;
-        doctors[victim].patient = waiting;
+        start_process(waiting, doctors, victim, time);
     }
 }
 
@@ -347,16 +362,66 @@ void schedule_preemptive_priority(
  */
 void schedule(ReadySet *ready,
               DoctorSlot doctors[DOCTORS],
-              Algorithm algorithm)
+              Algorithm algorithm,
+              int64_t time)
 {
     if (algorithm == PRIORITY_PREEMPTIVE) {
-        schedule_preemptive_priority(ready, doctors);
+        schedule_preemptive_priority(ready, doctors, time);
     } else {
-        schedule_non_preemptive(ready, doctors, algorithm);
+        schedule_non_preemptive(ready, doctors, algorithm, time);
     }
 }
 
-/* ---------- Minimal demonstration ---------- */
+/* ---------- 16.3: Discrete-event execution ---------- */
+
+void simulate(Process processes[], int n, Algorithm algorithm)
+{
+    ReadySet ready = {.count = 0};
+    DoctorSlot doctors[DOCTORS] = {{NULL}, {NULL}};
+    int64_t time = 0;
+    int completed = 0;
+
+    while (completed < n) {
+        /* Completions at this timestamp were handled on the last step.
+         * Admit every simultaneous arrival before selecting new patients. */
+        admit_arrivals(processes, n, time, &ready);
+        schedule(&ready, doctors, algorithm, time);
+
+        int64_t next = INT64_MAX;
+
+        for (int i = 0; i < n; i++) {
+            if (processes[i].state == NEW && processes[i].arrival < next)
+                next = processes[i].arrival;
+        }
+
+        for (int d = 0; d < DOCTORS; d++) {
+            Process *p = doctors[d].patient;
+            if (p != NULL && time + p->remaining < next)
+                next = time + p->remaining;
+        }
+
+        /* With positive service times, each step reaches a later event.
+         * Idle intervals jump straight to the next arrival. */
+        int64_t elapsed = next - time;
+        for (int d = 0; d < DOCTORS; d++) {
+            Process *p = doctors[d].patient;
+            if (p == NULL)
+                continue;
+
+            p->remaining -= elapsed;
+            if (p->remaining == 0) {
+                p->state = TERMINATED;
+                p->completion = next;
+                p->doctor = -1;
+                doctors[d].patient = NULL;
+                completed++;
+            }
+        }
+        time = next;
+    }
+}
+
+/* ---------- Command-line entry point ---------- */
 
 int main(int argc, char *argv[])
 {
@@ -386,49 +451,12 @@ int main(int argc, char *argv[])
     if (!load_processes(argv[1], processes, &n))
         return EXIT_FAILURE;
 
-    ReadySet ready = {.count = 0};
-    DoctorSlot doctors[DOCTORS] = {{NULL}, {NULL}};
+    simulate(processes, n, algorithm);
 
-    /*
-     * This module deliberately stops at 16.1 and 16.2.
-     * It creates processes, admits arrivals, and selects
-     * which patients should run. It does not simulate
-     * elapsed service time or calculate metrics.
-     */
-    int time = 0;
-    int admitted = 0;
-
-    while (admitted < n) {
-        admit_arrivals(processes, n, time, &ready);
-
-        for (int i = 0; i < n; i++) {
-            if (processes[i].state != NEW)
-                admitted++;
-        }
-
-        schedule(&ready, doctors, algorithm);
-
-        /*
-         * The execution module must advance time and clear
-         * doctor slots on completion. This standalone driver
-         * therefore exits after demonstrating the initial
-         * scheduling decision.
-         */
-        break;
+    for (int i = 0; i < n; i++) {
+        printf("Patient %s: Start %" PRId64 ", Completion %" PRId64 "\n",
+               processes[i].id, processes[i].start, processes[i].completion);
     }
-
-    printf("Initial scheduling decision at time %d:\n", time);
-
-    for (int d = 0; d < DOCTORS; d++) {
-        if (doctors[d].patient != NULL) {
-            printf("Doctor %d: Patient %s\n",
-                   d + 1, doctors[d].patient->id);
-        } else {
-            printf("Doctor %d: Idle\n", d + 1);
-        }
-    }
-
-    printf("Patients in READY set: %d\n", ready.count);
 
     return EXIT_SUCCESS;
 }
