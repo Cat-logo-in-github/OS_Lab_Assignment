@@ -1,12 +1,13 @@
+#define _POSIX_C_SOURCE 200809L
+#include <ctype.h>
+#include <errno.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define MAX_PROCESSES 1000
-#define MAX_ID 32
-#define MAX_CATEGORY 64
 #define DOCTORS 2
 
 typedef enum {
@@ -23,11 +24,11 @@ typedef enum {
 } Algorithm;
 
 typedef struct {
-    char id[MAX_ID];
+    char *id;
     int arrival;
     int priority;
     int service;
-    char category[MAX_CATEGORY];
+    char *category;
 
     ProcessState state;
     int doctor;              /* -1 if not assigned */
@@ -37,7 +38,7 @@ typedef struct {
 } Process;
 
 typedef struct {
-    Process *items[MAX_PROCESSES];
+    Process **items;
     int count;
 } ReadySet;
 
@@ -47,79 +48,141 @@ typedef struct {
 
 /* ---------- 16.1: Process Creation and Arrival ---------- */
 
-int load_processes(const char *filename,
-                   Process processes[],
-                   int *n)
+char *trim(char *text)
+{
+    while (isspace((unsigned char)*text))
+        text++;
+    char *end = text + strlen(text);
+    while (end > text && isspace((unsigned char)end[-1]))
+        *--end = '\0';
+    return text;
+}
+
+int parse_integer(const char *text, int minimum, int *value)
+{
+    char *end;
+    errno = 0;
+    long parsed = strtol(text, &end, 10);
+    if (text == end || *end != '\0' || errno == ERANGE ||
+        parsed < minimum || parsed > INT_MAX)
+        return 0;
+    *value = (int)parsed;
+    return 1;
+}
+
+/* Return 1 for a line, 0 for EOF, and -1 for a read error or binary data. */
+int read_line(FILE *fp, char **line, size_t *capacity)
+{
+    ssize_t length = getline(line, capacity, fp);
+    if (length < 0) {
+        if (ferror(fp)) {
+            fprintf(stderr, "Could not read input file\n");
+            return -1;
+        }
+        return 0;
+    }
+    if (memchr(*line, '\0', (size_t)length) != NULL) {
+        fprintf(stderr, "Input contains a NUL byte\n");
+        return -1;
+    }
+    return 1;
+}
+
+void free_processes(Process processes[], int n)
+{
+    for (int i = 0; i < n; i++) {
+        free(processes[i].id);
+        free(processes[i].category);
+    }
+    free(processes);
+}
+
+int load_processes(const char *filename, Process **processes, int *n)
 {
     FILE *fp = fopen(filename, "r");
-
     if (fp == NULL) {
         perror("Could not open input file");
         return 0;
     }
 
+    char *line = NULL;
+    size_t capacity = 0;
     int count;
     int quantum;
+    int created = 0;
+    Process *loaded = NULL;
 
-    if (fscanf(fp, "%d", &count) != 1 ||
-        fscanf(fp, "%d", &quantum) != 1 ||
-        count < 1 || count > MAX_PROCESSES) {
-        fprintf(stderr, "Invalid input header\n");
-        fclose(fp);
-        return 0;
+    if (read_line(fp, &line, &capacity) != 1 ||
+        !parse_integer(trim(line), 1, &count) ||
+        read_line(fp, &line, &capacity) != 1 ||
+        !parse_integer(trim(line), 1, &quantum)) {
+        fprintf(stderr, "N and Q must be positive integers no greater than %d\n",
+                INT_MAX);
+        goto failure;
     }
 
-    /* Read each patient record. */
-    for (int i = 0; i < count; i++) {
-        char line[256];
+    loaded = calloc((size_t)count, sizeof(*loaded));
+    if (loaded == NULL) {
+        fprintf(stderr, "Out of memory while creating patients\n");
+        goto failure;
+    }
 
-        if (fgets(line, sizeof(line), fp) == NULL) {
-            /* Skip leftover newline after the header. */
-            i--;
-            if (feof(fp)) {
-                fprintf(stderr, "Missing patient records\n");
-                fclose(fp);
-                return 0;
-            }
+    while (created < count) {
+        if (read_line(fp, &line, &capacity) != 1) {
+            fprintf(stderr, "Missing patient records\n");
+            goto failure;
+        }
+
+        char *record = trim(line);
+        if (*record == '\0')
             continue;
+
+        char *fields[5];
+        char *cursor = record;
+        for (int field = 0; field < 4; field++) {
+            char *comma = strchr(cursor, ',');
+            if (comma == NULL) {
+                fprintf(stderr, "Patient record %d must have five fields\n",
+                        created + 1);
+                goto failure;
+            }
+            *comma = '\0';
+            fields[field] = trim(cursor);
+            cursor = comma + 1;
+        }
+        fields[4] = trim(cursor);
+
+        if (*fields[0] == '\0' || *fields[4] == '\0' ||
+            strchr(fields[4], ',') != NULL ||
+            strchr(fields[0], '\r') != NULL || strchr(fields[4], '\r') != NULL) {
+            fprintf(stderr, "Invalid patient ID or category in record %d\n",
+                    created + 1);
+            goto failure;
         }
 
-        if (line[0] == '\n' || line[0] == '\r')
-        {
-            i--;
-            continue;
+        Process *p = &loaded[created];
+        if (!parse_integer(fields[1], 0, &p->arrival) ||
+            !parse_integer(fields[2], 1, &p->priority) ||
+            !parse_integer(fields[3], 1, &p->service)) {
+            fprintf(stderr, "Invalid numeric values in patient record %d\n",
+                    created + 1);
+            goto failure;
         }
 
-        Process *p = &processes[i];
-
-        if (sscanf(line, " %31[^,],%d,%d,%d,%63[^\r\n]",
-                   p->id,
-                   &p->arrival,
-                   &p->priority,
-                   &p->service,
-                   p->category) != 5) {
-            fprintf(stderr, "Invalid patient record: %s", line);
-            fclose(fp);
-            return 0;
-        }
-
-        if (p->arrival < 0 ||
-            p->priority <= 0 ||
-            p->service <= 0) {
-            fprintf(stderr, "Invalid values for patient %s\n", p->id);
-            fclose(fp);
-            return 0;
-        }
-
-        /* IDs must be unique. */
-        for (int j = 0; j < i; j++) {
-            if (strcmp(processes[j].id, p->id) == 0) {
-                fprintf(stderr, "Duplicate patient ID: %s\n", p->id);
-                fclose(fp);
-                return 0;
+        for (int j = 0; j < created; j++) {
+            if (strcmp(loaded[j].id, fields[0]) == 0) {
+                fprintf(stderr, "Duplicate patient ID: %s\n", fields[0]);
+                goto failure;
             }
         }
 
+        p->id = strdup(fields[0]);
+        p->category = strdup(fields[4]);
+        created++;
+        if (p->id == NULL || p->category == NULL) {
+            fprintf(stderr, "Out of memory while reading patients\n");
+            goto failure;
+        }
         p->state = NEW;
         p->doctor = -1;
         p->remaining = p->service;
@@ -127,9 +190,28 @@ int load_processes(const char *filename,
         p->completion = -1;
     }
 
+    /* Extra nonblank records usually indicate an incorrect N. */
+    int status;
+    while ((status = read_line(fp, &line, &capacity)) == 1) {
+        if (*trim(line) != '\0') {
+            fprintf(stderr, "Unexpected data after %d patient records\n", count);
+            goto failure;
+        }
+    }
+    if (status == -1)
+        goto failure;
+
+    free(line);
     fclose(fp);
+    *processes = loaded;
     *n = count;
     return 1;
+
+failure:
+    free(line);
+    free_processes(loaded, created);
+    fclose(fp);
+    return 0;
 }
 
 /* Move patients into READY when their arrival time is reached. */
@@ -374,9 +456,13 @@ void schedule(ReadySet *ready,
 
 /* ---------- 16.3: Discrete-event execution ---------- */
 
-void simulate(Process processes[], int n, Algorithm algorithm)
+int simulate(Process processes[], int n, Algorithm algorithm)
 {
-    ReadySet ready = {.count = 0};
+    ReadySet ready = {.items = calloc((size_t)n, sizeof(*ready.items)), .count = 0};
+    if (ready.items == NULL) {
+        fprintf(stderr, "Out of memory while creating the ready set\n");
+        return 0;
+    }
     DoctorSlot doctors[DOCTORS] = {{NULL}, {NULL}};
     int64_t time = 0;
     int completed = 0;
@@ -419,6 +505,8 @@ void simulate(Process processes[], int n, Algorithm algorithm)
         }
         time = next;
     }
+    free(ready.items);
+    return 1;
 }
 
 /* ---------- 16.4: Metrics and standardized output ---------- */
@@ -496,14 +584,18 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    Process processes[MAX_PROCESSES];
+    Process *processes = NULL;
     int n = 0;
 
-    if (!load_processes(argv[1], processes, &n))
+    if (!load_processes(argv[1], &processes, &n))
         return EXIT_FAILURE;
 
-    simulate(processes, n, algorithm);
+    if (!simulate(processes, n, algorithm)) {
+        free_processes(processes, n);
+        return EXIT_FAILURE;
+    }
     print_results(processes, n);
+    free_processes(processes, n);
 
     return EXIT_SUCCESS;
 }
