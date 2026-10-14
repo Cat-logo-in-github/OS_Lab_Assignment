@@ -1,12 +1,12 @@
 # Emergency Hospital Management - Assignment 1
 
-CS-3710 Assignment 1: a deterministic process-management simulation in C.
+A deterministic process-management simulation in C.
 Patients are processes, and two identical doctors are parallel execution slots.
 The program implements FCFS, non-preemptive Priority, and preemptive Priority.
 
 ## Team
 
-- Yesirat (GitHub: Yesy01)
+- Yesirat
 - Parshwa Doshi
 - Sudyotman Sudershan
 
